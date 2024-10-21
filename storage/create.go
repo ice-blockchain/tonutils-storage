@@ -30,6 +30,21 @@ type FileRef interface {
 }
 
 func CreateTorrent(ctx context.Context, filesRootPath, dirName, description string, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64)) (*Torrent, error) {
+	if dirName == "/" {
+		dirName = ""
+	}
+	if err := validateFileName(dirName, false); err != nil {
+		return nil, err
+	}
+	header := &TorrentHeader{
+		DirNameSize: uint32(len(dirName)),
+		DirName:     []byte(dirName),
+	}
+
+	return CreateTorrentWithInitialHeader(ctx, filesRootPath, description, header, db, connector, files, progressCallback, true)
+}
+
+func CreateTorrentWithInitialHeader(ctx context.Context, filesRootPath, description string, header *TorrentHeader, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64), verbose bool) (*Torrent, error) {
 	if len(files) == 0 {
 		return nil, fmt.Errorf("0 files in torrent")
 	}
@@ -38,19 +53,8 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 	cb := make([]byte, pieceSize)
 	cbOffset := 0
 
-	if dirName == "/" {
-		dirName = ""
-	}
-
-	if err := validateFileName(dirName, false); err != nil {
-		return nil, err
-	}
-
 	torrent := NewTorrent(filesRootPath, db, connector)
-	torrent.Header = &TorrentHeader{
-		DirNameSize: uint32(len(dirName)),
-		DirName:     []byte(dirName),
-	}
+	torrent.Header = header
 
 	var maxProgress, doneProgress uint64
 	incProgress := func(num uint64) {
@@ -59,8 +63,10 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 			progressCallback(doneProgress, maxProgress)
 		}
 	}
-
-	waiter, _ := pterm.DefaultSpinner.Start("Scanning files...")
+	var waiter *pterm.SpinnerPrinter = nil
+	if verbose {
+		waiter, _ = pterm.DefaultSpinner.Start("Scanning files...")
+	}
 
 	var dataSize uint64
 	for _, file := range files {
@@ -116,7 +122,9 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 				piecesStartIndexes = append(piecesStartIndexes, pieceStartFileIndex)
 
 				cbOffset = 0
-				progress.Increment()
+				if progress != nil {
+					progress.Increment()
+				}
 				incProgress(3)
 			}
 		}
@@ -126,12 +134,18 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 		}
 		return nil
 	}
-	waiter.Success()
+	if waiter != nil {
+		waiter.Success()
+	}
+	if waiter != nil {
+		waiter, _ = pterm.DefaultSpinner.Start("Generating bag header...")
+	}
 
-	waiter, _ = pterm.DefaultSpinner.Start("Generating bag header...")
 	headerData, err := tl.Serialize(torrent.Header, true)
 	if err != nil {
-		waiter.Fail(err.Error())
+		if waiter != nil {
+			waiter.Fail(err.Error())
+		}
 		return nil, fmt.Errorf("failed to serialize header: %w", err)
 	}
 
@@ -142,15 +156,22 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 	}
 
 	maxProgress = piecesNum * 4
-
-	progress, _ := pterm.DefaultProgressbar.WithTotal(int(piecesNum)).WithTitle("Calculating pieces...").Start()
+	var progress *pterm.ProgressbarPrinter = nil
+	if verbose {
+		progress, _ = pterm.DefaultProgressbar.WithTotal(int(piecesNum)).WithTitle("Calculating pieces...").Start()
+	}
 
 	err = process("", true, bytes.NewBuffer(headerData), progress)
 	if err != nil {
-		waiter.Fail(err.Error())
+		if waiter != nil {
+			waiter.Fail(err.Error())
+		}
+
 		return nil, fmt.Errorf("failed to process header piece: %w", err)
 	}
-	waiter.Success()
+	if waiter != nil {
+		waiter.Success()
+	}
 
 	// add files
 	for _, f := range files {
@@ -179,17 +200,27 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 
 		// save index of file where block starts
 		piecesStartIndexes = append(piecesStartIndexes, pieceStartFileIndex)
-		progress.Increment()
+		if progress != nil {
+			progress.Increment()
+		}
 		incProgress(3)
 	}
-	_, _ = progress.Stop()
+	if progress != nil {
+		_, _ = progress.Stop()
+	}
 
-	waiter, _ = pterm.DefaultSpinner.Start("Building merkle tree...")
+	if waiter != nil {
+		waiter, _ = pterm.DefaultSpinner.Start("Building merkle tree...")
+	}
+
 	hashTree := buildMerkleTree(hashes, 9) // 9 is most efficient in most cases
 	rootHash := hashTree.Hash()
-	waiter.Success("Merkle tree successfully built")
-
-	progress, _ = pterm.DefaultProgressbar.WithTotal(int(piecesNum)).WithTitle("Calculating proofs...").Start()
+	if waiter != nil {
+		waiter.Success("Merkle tree successfully built")
+	}
+	if progress != nil {
+		progress, _ = pterm.DefaultProgressbar.WithTotal(int(piecesNum)).WithTitle("Calculating proofs...").Start()
+	}
 
 	piecesNum = uint64(len(piecesStartIndexes))
 	pcNumBytes := len(piecesStartIndexes) / 8
@@ -212,7 +243,10 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 
 	tCell, err := tlb.ToCell(torrent.Info)
 	if err != nil {
-		waiter.Fail(err.Error())
+		if waiter != nil {
+			waiter.Fail(err.Error())
+		}
+
 		return nil, err
 	}
 	torrent.BagID = tCell.Hash()
@@ -259,12 +293,17 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 	for i, idx := range piecesStartIndexes {
 		select {
 		case <-ctx.Done():
-			_, _ = progress.Stop()
+			if progress != nil {
+				_, _ = progress.Stop()
+			}
+
 			return nil, ctx.Err()
 		case err = <-toCalcErr:
 			return nil, fmt.Errorf("failed to calc proof for piece: %w", err)
 		case toCalc <- &calcReq{id: uint32(i), startIndex: idx}:
-			progress.Increment()
+			if progress != nil {
+				progress.Increment()
+			}
 			incProgress(1)
 		}
 	}

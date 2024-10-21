@@ -297,7 +297,9 @@ func (s *storagePeer) Close() {
 func (s *storagePeer) touch() {
 	s.torrent.TouchPeer(s)
 	s.activateOnce.Do(func() {
-		go s.pieceNotifier()
+		if s.globalCtx != nil {
+			go s.pieceNotifier()
+		}
 	})
 }
 
@@ -309,9 +311,9 @@ func (s *storagePeer) pinger(srv *Server) {
 	var lastPeersReq time.Time
 
 	startedAt := time.Now()
-	fails := 0
+	fails := int32(0)
 	for {
-		wait := 250 * time.Millisecond
+		wait := 10 * time.Second
 		if s.sessionId != 0 {
 			wait = 10 * time.Second
 			// session should be initialised
@@ -323,10 +325,12 @@ func (s *storagePeer) pinger(srv *Server) {
 				fails++
 				if fails >= 3 {
 					Logger("[STORAGE] NODE NOT RESPOND 3 PINGS IN A ROW, CLOSING CONNECTION WITH ", hex.EncodeToString(s.nodeId), s.nodeAddr, err.Error())
+					s.conn.FailedFor(s, err, true)
 					return
 				}
 			} else {
 				fails = 0
+				s.conn.FailedFor(s, nil, false)
 				s.touch()
 			}
 		} else {
@@ -454,6 +458,7 @@ func (s *storagePeer) downloadPiece(ctx context.Context, id uint32) (*Piece, err
 			if atomic.LoadInt32(&s.fails) >= 3 {
 				Logger("[STORAGE] TOO MANY FAILS FROM", s.nodeAddr, "CLOSING CONNECTION, ERR:", err.Error())
 				// something wrong, close connection, we should reconnect after it
+				s.conn.FailedFor(s, err, false)
 				s.Close()
 			}
 		}
@@ -461,6 +466,7 @@ func (s *storagePeer) downloadPiece(ctx context.Context, id uint32) (*Piece, err
 	}
 	atomic.StoreInt32(&s.fails, 0)
 	atomic.StoreInt64(&s.failAt, 0)
+	s.conn.FailedFor(s, nil, false)
 
 	return &piece, nil
 }

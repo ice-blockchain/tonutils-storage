@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/xssnick/tonutils-go/adnl"
+	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
@@ -28,18 +29,21 @@ type Server struct {
 	store    Storage
 	closeCtx context.Context
 
-	bootstrapped map[string]*PeerConnection
-	mx           sync.RWMutex
+	bootstrapped    map[string]*PeerConnection
+	registeredAddrs map[string]*address.List
+	addrMx          sync.RWMutex
+	mx              sync.RWMutex
 
 	closer func()
 }
 
 func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serverMode bool) *Server {
 	s := &Server{
-		key:          key,
-		dht:          dht,
-		gate:         gate,
-		bootstrapped: map[string]*PeerConnection{},
+		key:             key,
+		dht:             dht,
+		gate:            gate,
+		bootstrapped:    map[string]*PeerConnection{},
+		registeredAddrs: map[string]*address.List{},
 	}
 	s.closeCtx, s.closer = context.WithCancel(context.Background())
 	s.gate.SetConnectionHandler(s.bootstrapPeerWrap)
@@ -83,7 +87,7 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serv
 				select {
 				case <-s.closeCtx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(600 * time.Second):
 				}
 
 				if s.store == nil {
@@ -167,6 +171,7 @@ func (s *Server) bootstrapPeer(client adnl.Peer) *PeerConnection {
 		rldp:       rl,
 		adnl:       client,
 		usedByBags: map[string]*storagePeer{},
+		failedBags: map[string]bool{},
 	}
 	s.bootstrapped[hex.EncodeToString(client.GetID())] = p
 
@@ -586,7 +591,10 @@ func (s *Server) nodeConnector(adnlID []byte, t *Torrent, node *overlay.Node, at
 	}
 
 	scaleCtx, stopScale := context.WithTimeout(t.globalCtx, 120*time.Second)
-	stNode, err := s.connectToNode(scaleCtx, t, adnlID, node)
+	s.addrMx.RLock()
+	addr := s.registeredAddrs[string(adnlID)]
+	s.addrMx.RUnlock()
+	stNode, err := s.connectToNode(scaleCtx, t, adnlID, node, addr, node.ID.(adnl.PublicKeyED25519).Key)
 	stopScale()
 	if err != nil {
 		onFail()
@@ -602,21 +610,34 @@ func (s *Server) nodeConnector(adnlID []byte, t *Torrent, node *overlay.Node, at
 
 	Logger("[STORAGE] ADDED PEER", hex.EncodeToString(adnlID), "FOR", hex.EncodeToString(t.BagID))
 }
+func (s *Server) ConnectToNode(ctx context.Context, t *Torrent, node *overlay.Node, addrList *address.List, nodeKey ed25519.PublicKey) error {
+	adnlID, err := tl.Hash(adnl.PublicKeyED25519{Key: nodeKey})
+	if err != nil {
+		return fmt.Errorf("failed build adnl from node key: %w", err)
+	}
+	Logger("[STORAGE] CONNECTING WITH BOOTSTRAP", hex.EncodeToString(adnlID), adnlID, "FOR", hex.EncodeToString(t.BagID))
+	_, err = s.connectToNode(ctx, t, adnlID, node, addrList, nodeKey)
+	return err
+}
 
-func (s *Server) connectToNode(ctx context.Context, t *Torrent, adnlID []byte, node *overlay.Node) (*storagePeer, error) {
+func (s *Server) connectToNode(ctx context.Context, t *Torrent, adnlID []byte, node *overlay.Node, addrs *address.List, keyN ed25519.PublicKey) (*storagePeer, error) {
 	peer := s.GetPeerIfActive(adnlID)
 	if peer == nil {
 		start := time.Now()
-		lcCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-		addrs, keyN, err := s.dht.FindAddresses(lcCtx, adnlID)
-		cancel()
-		if err != nil {
-			Logger("[STORAGE] NOT FOUND NODE ADDR OF", hex.EncodeToString(adnlID), "FOR", hex.EncodeToString(t.BagID), "ERR", err.Error())
-			return nil, fmt.Errorf("failed to find node address: %w", err)
+		if addrs == nil {
+			lcCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			var err error
+			addrs, keyN, err = s.dht.FindAddresses(lcCtx, adnlID)
+			cancel()
+			if err != nil {
+				Logger("[STORAGE] NOT FOUND NODE ADDR OF", hex.EncodeToString(adnlID), "FOR", hex.EncodeToString(t.BagID), "ERR", err.Error())
+				return nil, fmt.Errorf("failed to find node address: %w", err)
+			}
 		}
-
 		Logger("[STORAGE] ADDR FOR NODE ", hex.EncodeToString(adnlID), "FOUND", addrs.Addresses[0].IP.String(), "FOR", hex.EncodeToString(t.BagID), "ELAPSED", time.Since(start).Seconds())
-
+		s.addrMx.Lock()
+		s.registeredAddrs[string(adnlID)] = addrs
+		s.addrMx.Unlock()
 		addr := addrs.Addresses[0].IP.String() + ":" + fmt.Sprint(addrs.Addresses[0].Port)
 
 		ax, err := s.gate.RegisterClient(addr, keyN)
@@ -697,7 +718,7 @@ func (s *Server) StartPeerSearcher(t *Torrent) {
 	var nodesDhtCont *dht.Continuation
 	var sameContTries int
 	for {
-		wait := 5
+		wait := 180
 
 		sameContTries++
 
@@ -758,6 +779,8 @@ func (s *Server) GetADNLPrivateKey() ed25519.PrivateKey {
 	return s.key
 }
 
+var c int64
+
 func (t *Torrent) initStoragePeer(globalCtx context.Context, overlay []byte, srv *Server, conn *PeerConnection, sessionId int64) *storagePeer {
 	if n := conn.GetFor(t.BagID); n != nil {
 		return n
@@ -776,7 +799,9 @@ func (t *Torrent) initStoragePeer(globalCtx context.Context, overlay []byte, srv
 
 	conn.UseFor(stNode)
 	stNode.globalCtx, stNode.stop = context.WithCancel(globalCtx)
-	go stNode.pinger(srv)
+	if downloading := t.IsDownloadAll(); downloading {
+		go stNode.pinger(srv)
+	}
 
 	return stNode
 }
