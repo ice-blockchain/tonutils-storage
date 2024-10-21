@@ -103,7 +103,7 @@ func (t *Torrent) touchPeer(peer *storagePeer) *PeerInfo {
 			},
 		}
 
-		if peer.globalCtx.Err() == nil {
+		if peer.globalCtx != nil && peer.globalCtx.Err() == nil {
 			// add only if it is alive
 			t.peers[strId] = p
 		}
