@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"io"
 	"math/bits"
 	"sync"
@@ -105,11 +106,11 @@ type Torrent struct {
 	connector  NetConnector
 	downloader TorrentDownloader
 
-	knownNodes map[string]*overlay.Node
-	peers      map[string]*PeerInfo
-	peersMx    sync.RWMutex
-
-	db Storage
+	knownNodes   map[string]*overlay.Node
+	peers        map[string]*PeerInfo
+	peersMx      sync.RWMutex
+	nodesDhtCont *dht.Continuation
+	db           Storage
 
 	// completedCtx context.Context
 	globalCtx context.Context
@@ -203,6 +204,10 @@ func (t *Torrent) Stop() {
 }
 
 func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err error) {
+	return t.StartWithCallback(withUpload, downloadAll, downloadOrdered, nil)
+}
+
+func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered bool, report func(event Event)) (err error) {
 	t.activeUpload = withUpload
 
 	t.mx.Lock()
@@ -237,8 +242,8 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 
 	t.globalCtx, t.pause = context.WithCancel(context.Background())
 	// t.completedCtx, t.complete = context.WithCancel(context.Background())
-	go t.runPeersMonitor()
-	go t.connector.StartPeerSearcher(t)
+	//go t.runPeersMonitor()
+	t.connector.StartPeerSearcher(t)
 
 	if t.IsCompleted() {
 		//	t.complete()
@@ -250,6 +255,9 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 	return t.startDownload(func(event Event) {
 		if event.Name == EventErr && currFlag == t.currentDownloadFlag {
 			currPause()
+		}
+		if report != nil {
+			report(event)
 		}
 	})
 }
