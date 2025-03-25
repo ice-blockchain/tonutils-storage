@@ -15,7 +15,9 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	pq "gopkg.in/dnaeon/go-priorityqueue.v1"
 	"math/rand"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -23,12 +25,12 @@ import (
 )
 
 type Server struct {
-	key      ed25519.PrivateKey
-	dht      *dht.Client
-	gate     *adnl.Gateway
-	store    Storage
-	closeCtx context.Context
-
+	key             ed25519.PrivateKey
+	dht             *dht.Client
+	gate            *adnl.Gateway
+	store           Storage
+	closeCtx        context.Context
+	torrentQueue    *pq.PriorityQueue[*Torrent, int64]
 	bootstrapped    map[string]*PeerConnection
 	registeredAddrs map[string]*address.List
 	addrMx          sync.RWMutex
@@ -43,12 +45,17 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serv
 		dht:             dht,
 		gate:            gate,
 		bootstrapped:    map[string]*PeerConnection{},
+		torrentQueue:    pq.New[*Torrent, int64](pq.MinHeap),
 		registeredAddrs: map[string]*address.List{},
 	}
 	s.closeCtx, s.closer = context.WithCancel(context.Background())
 	s.gate.SetConnectionHandler(s.bootstrapPeerWrap)
 
 	if serverMode {
+		for _ = range runtime.NumCPU() {
+			go s.peerSearchWorker()
+		}
+
 		go func() {
 			wait := 1 * time.Second
 			// refresh dht records
@@ -83,11 +90,12 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serv
 			var mx sync.Mutex
 			lastUpdate := map[string]time.Time{}
 			// refresh dht records
+			wait := 1
 			for {
 				select {
 				case <-s.closeCtx.Done():
 					return
-				case <-time.After(600 * time.Second):
+				case <-time.After(time.Duration(wait) * time.Second):
 				}
 
 				if s.store == nil {
@@ -124,6 +132,7 @@ func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serv
 				}
 				wg.Wait()
 				cancel()
+				wait = 600
 			}
 		}()
 	}
@@ -813,65 +822,110 @@ func (s *storagePeer) prepareTorrentInfo(t *Torrent) error {
 }
 
 func (s *Server) StartPeerSearcher(t *Torrent) {
-	var nodesDhtCont *dht.Continuation
-	var sameContTries int
+	s.torrentQueue.Put(t, time.Now().UnixNano())
+}
+func (s *Server) peerSearchWorker() {
 	for {
-		wait := 180
-
-		sameContTries++
-
+		if s.torrentQueue.IsEmpty() {
+			<-time.After(1 * time.Second)
+			continue
+		}
+		t := s.torrentQueue.Get().Value
+		select {
+		case <-s.closeCtx.Done():
+		default:
+		}
 		var err error
 		var nodes *overlay.NodesList
 		Logger("[STORAGE] SEARCHING PEERS FOR", hex.EncodeToString(t.BagID))
 
 		ctxFind, cancel := context.WithTimeout(t.globalCtx, time.Duration(60)*time.Second)
-		nodes, nodesDhtCont, err = s.dht.FindOverlayNodes(ctxFind, t.BagID, nodesDhtCont)
+		nodes, t.nodesDhtCont, err = s.dht.FindOverlayNodes(ctxFind, t.BagID, t.nodesDhtCont)
 		cancel()
 		if err != nil {
-			select {
-			case <-t.globalCtx.Done():
-				Logger("[STORAGE] DHT CONTEXT CANCEL", hex.EncodeToString(t.BagID))
-				return
-			case <-time.After(time.Duration(wait) * time.Second):
-				sameContTries = 0
-				nodesDhtCont = nil
-				Logger("[STORAGE] DHT RETRY", hex.EncodeToString(t.BagID))
-				continue
+			if t.globalCtx.Err() == nil {
+				if s.torrentQueue.IsEmpty() {
+					<-time.After(1 * time.Second)
+				}
+				s.torrentQueue.Put(t, time.Now().UnixNano())
 			}
+			continue
 		}
 
 		for i := range nodes.List {
 			// add known nodes in case we will need them in future to scale
 			s.addTorrentNode(&nodes.List[i], t)
 		}
-
-		t.peersMx.RLock()
-		peersNum := len(t.peers)
-		t.peersMx.RUnlock()
-
-		if peersNum > 0 {
-			// found nodes, long sleep
-			wait = peersNum * 60
-			if wait > 300 {
-				wait = 300
-			}
-
-			sameContTries = 0
-			nodesDhtCont = nil
-		} else if sameContTries >= 3 {
-			sameContTries = 0
-			nodesDhtCont = nil
-		}
-
 		Logger("[STORAGE] OVERLAY CHECKED HAS NODES", len(nodes.List), hex.EncodeToString(t.BagID))
-
-		select {
-		case <-t.globalCtx.Done():
-			return
-		case <-time.After(time.Duration(wait) * time.Second):
+		if t.globalCtx.Err() == nil {
+			if s.torrentQueue.IsEmpty() {
+				<-time.After(1 * time.Second)
+			}
+			s.torrentQueue.Put(t, time.Now().UnixNano())
 		}
 	}
 }
+
+//func (s *Server) StartPeerSearcher(t *Torrent) {
+//	var nodesDhtCont *dht.Continuation
+//	var sameContTries int
+//	for {
+//		wait := 180
+//
+//		sameContTries++
+//
+//		var err error
+//		var nodes *overlay.NodesList
+//		Logger("[STORAGE] SEARCHING PEERS FOR", hex.EncodeToString(t.BagID))
+//
+//		ctxFind, cancel := context.WithTimeout(t.globalCtx, time.Duration(60)*time.Second)
+//		nodes, nodesDhtCont, err = s.dht.FindOverlayNodes(ctxFind, t.BagID, nodesDhtCont)
+//		cancel()
+//		if err != nil {
+//			select {
+//			case <-t.globalCtx.Done():
+//				Logger("[STORAGE] DHT CONTEXT CANCEL", hex.EncodeToString(t.BagID))
+//				return
+//			case <-time.After(time.Duration(wait) * time.Second):
+//				sameContTries = 0
+//				nodesDhtCont = nil
+//				Logger("[STORAGE] DHT RETRY", hex.EncodeToString(t.BagID))
+//				continue
+//			}
+//		}
+//
+//		for i := range nodes.List {
+//			// add known nodes in case we will need them in future to scale
+//			s.addTorrentNode(&nodes.List[i], t)
+//		}
+//
+//		t.peersMx.RLock()
+//		peersNum := len(t.peers)
+//		t.peersMx.RUnlock()
+//
+//		if peersNum > 0 {
+//			// found nodes, long sleep
+//			wait = peersNum * 60
+//			if wait > 300 {
+//				wait = 300
+//			}
+//
+//			sameContTries = 0
+//			nodesDhtCont = nil
+//		} else if sameContTries >= 3 {
+//			sameContTries = 0
+//			nodesDhtCont = nil
+//		}
+//
+//		Logger("[STORAGE] OVERLAY CHECKED HAS NODES", len(nodes.List), hex.EncodeToString(t.BagID))
+//
+//		select {
+//		case <-t.globalCtx.Done():
+//			return
+//		case <-time.After(time.Duration(wait) * time.Second):
+//		}
+//	}
+//}
 
 func (s *Server) GetADNLPrivateKey() ed25519.PrivateKey {
 	return s.key
