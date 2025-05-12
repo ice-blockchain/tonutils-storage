@@ -84,6 +84,9 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 	}
 	f.mx.RUnlock()
 
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for ctx.Err() == nil {
 		f.mx.RLock()
 		if p := f.pieces[piece]; p != nil {
@@ -96,7 +99,7 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 		select {
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
-		case <-time.After(300 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 
@@ -119,7 +122,7 @@ func (f *PreFetcher) Free(piece uint32) {
 }
 
 func (f *PreFetcher) worker() {
-	for {
+	for f.ctx.Err() == nil {
 		var task uint32
 		select {
 		case <-f.ctx.Done():
@@ -139,7 +142,7 @@ func (f *PreFetcher) worker() {
 			}
 		}
 
-		for {
+		for f.ctx.Err() == nil {
 			data, proof, _, _, err := f.downloader.DownloadPieceDetailed(f.ctx, task)
 			if err == nil {
 				f.mx.Lock()
