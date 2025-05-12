@@ -3,10 +3,11 @@ package storage
 import (
 	"context"
 	"fmt"
-	"github.com/pterm/pterm"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pterm/pterm"
 )
 
 type piecePack struct {
@@ -83,7 +84,7 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 	}
 	f.mx.RUnlock()
 
-	for {
+	for ctx.Err() == nil {
 		f.mx.RLock()
 		if p := f.pieces[piece]; p != nil {
 			f.mx.RUnlock()
@@ -95,9 +96,11 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 		select {
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
-		case <-time.After(5 * time.Millisecond):
+		case <-time.After(300 * time.Millisecond):
 		}
 	}
+
+	return nil, nil, ctx.Err()
 }
 
 func (f *PreFetcher) Free(piece uint32) {
@@ -128,7 +131,7 @@ func (f *PreFetcher) worker() {
 					select {
 					case <-f.ctx.Done():
 						return
-					case <-time.After(5 * time.Millisecond):
+					case <-time.After(100 * time.Millisecond):
 						continue
 					}
 				}
