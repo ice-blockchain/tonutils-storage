@@ -216,7 +216,7 @@ func (c *Connector) CreateDownloader(ctx context.Context, t *Torrent) (_ Torrent
 			case <-ctx.Done():
 				err = fmt.Errorf("failed to find storage nodes for this bag, err: %w", ctx.Err())
 				return nil, err
-			case <-time.After(10 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 
 			if dow.torrent.Info != nil {
