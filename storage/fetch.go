@@ -3,10 +3,11 @@ package storage
 import (
 	"context"
 	"fmt"
-	"github.com/pterm/pterm"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pterm/pterm"
 )
 
 type piecePack struct {
@@ -83,7 +84,10 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 	}
 	f.mx.RUnlock()
 
-	for {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for ctx.Err() == nil {
 		f.mx.RLock()
 		if p := f.pieces[piece]; p != nil {
 			f.mx.RUnlock()
@@ -95,9 +99,11 @@ func (f *PreFetcher) Get(ctx context.Context, piece uint32) ([]byte, []byte, err
 		select {
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
-		case <-time.After(5 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
+
+	return nil, nil, ctx.Err()
 }
 
 func (f *PreFetcher) Free(piece uint32) {
@@ -116,7 +122,7 @@ func (f *PreFetcher) Free(piece uint32) {
 }
 
 func (f *PreFetcher) worker() {
-	for {
+	for f.ctx.Err() == nil {
 		var task uint32
 		select {
 		case <-f.ctx.Done():
@@ -128,7 +134,7 @@ func (f *PreFetcher) worker() {
 					select {
 					case <-f.ctx.Done():
 						return
-					case <-time.After(5 * time.Millisecond):
+					case <-time.After(100 * time.Millisecond):
 						continue
 					}
 				}
@@ -136,7 +142,7 @@ func (f *PreFetcher) worker() {
 			}
 		}
 
-		for {
+		for f.ctx.Err() == nil {
 			data, proof, _, _, err := f.downloader.DownloadPieceDetailed(f.ctx, task)
 			if err == nil {
 				f.mx.Lock()

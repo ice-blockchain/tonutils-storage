@@ -8,6 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+
 	"github.com/kevinms/leakybucket-go"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
@@ -15,12 +22,6 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"math"
-	"math/rand"
-	"sync"
-	"sync/atomic"
-	"time"
-	"unsafe"
 )
 
 var Logger = func(...any) {}
@@ -215,7 +216,7 @@ func (c *Connector) CreateDownloader(ctx context.Context, t *Torrent) (_ Torrent
 			case <-ctx.Done():
 				err = fmt.Errorf("failed to find storage nodes for this bag, err: %w", ctx.Err())
 				return nil, err
-			case <-time.After(10 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 
 			if dow.torrent.Info != nil {
@@ -476,7 +477,7 @@ var DownloadMaxInflightScore = int32(400)
 // DownloadPieceDetailed - same as DownloadPiece, but also returns proof data
 func (t *torrentDownloader) DownloadPieceDetailed(ctx context.Context, pieceIndex uint32) (piece []byte, proof []byte, peer []byte, peerAddr string, err error) {
 	skip := map[string]*storagePeer{}
-	for {
+	for ctx.Err() == nil {
 		peers := t.torrent.GetPeers()
 
 		var bestNode *storagePeer
@@ -516,7 +517,7 @@ func (t *torrentDownloader) DownloadPieceDetailed(ctx context.Context, pieceInde
 			select {
 			case <-ctx.Done():
 				return nil, nil, nil, "", ctx.Err()
-			case <-time.After(5 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 				skip = map[string]*storagePeer{}
 				// no nodes, wait
 			}
@@ -542,6 +543,7 @@ func (t *torrentDownloader) DownloadPieceDetailed(ctx context.Context, pieceInde
 
 		return pc.Data, pc.Proof, bestNode.nodeId, bestNode.nodeAddr, nil
 	}
+	return nil, nil, nil, "", ctx.Err()
 }
 
 // DownloadPiece - downloads piece from one of available nodes.
