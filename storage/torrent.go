@@ -215,6 +215,9 @@ func (t *Torrent) Stop() {
 }
 
 func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err error) {
+	return t.StartWithCallback(withUpload, downloadAll, downloadOrdered, nil)
+}
+func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered bool, report func(event Event)) (err error) {
 	t.activeUpload = withUpload
 
 	t.mx.Lock()
@@ -224,21 +227,21 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 		return nil
 	}
 
-	if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
-		t.isVerificationInProgress = true
-		go func() {
-			// it will remove corrupted pieces
-			if err = t.verify(t.db.VerifyOnStartup()); err != nil {
-				Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
-			}
-
-			t.mx.Lock()
-			defer t.mx.Unlock()
-
-			t.lastVerified = time.Now()
-			t.isVerificationInProgress = false
-		}()
-	}
+	//if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
+	//	t.isVerificationInProgress = true
+	//	go func() {
+	//		// it will remove corrupted pieces
+	//		if err = t.verify(t.db.VerifyOnStartup()); err != nil {
+	//			Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
+	//		}
+	//
+	//		t.mx.Lock()
+	//		defer t.mx.Unlock()
+	//
+	//		t.lastVerified = time.Now()
+	//		t.isVerificationInProgress = false
+	//	}()
+	//}
 
 	t.downloadAll = downloadAll
 	t.downloadOrdered = downloadOrdered
@@ -249,7 +252,7 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 
 	t.globalCtx, t.pause = context.WithCancel(context.Background())
 
-	go t.peersManager(t.globalCtx)
+	//go t.peersManager(t.globalCtx)
 
 	if t.IsCompleted() {
 		//	t.complete()
@@ -262,13 +265,16 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 		if event.Name == EventErr && currFlag == t.currentDownloadFlag {
 			currPause()
 		}
+		if report != nil {
+			report(event)
+		}
 	})
 }
 
 func (t *Torrent) peersManager(workerCtx context.Context) {
 	defer Logger("[STORAGE_PEERS] PEER MANAGER STOPPED", "BAG", hex.EncodeToString(t.BagID))
 
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -339,12 +345,15 @@ func (t *Torrent) peersManager(workerCtx context.Context) {
 
 					if err := peer.ping(qCtx); err != nil && atomic.AddInt32(&peer.fails, 1) > 3 {
 						Logger("[STORAGE_PEERS] PING FAILED FOR PEER", hex.EncodeToString(peer.nodeId), "AND TOO MANY FAILS, CLOSING CONNECTION", "BAG", hex.EncodeToString(t.BagID))
+						peer.conn.FailedFor(peer, err, true)
 						peer.Close()
 						return
 					}
 					atomic.StoreInt32(&peer.fails, 0)
+					peer.conn.FailedFor(peer, nil, true)
 				}()
-			} else if time.Since(peer.lastNeighboursAt) > 30*time.Second {
+			}
+			if time.Since(peer.lastNeighboursAt) > 30*time.Second {
 				peer.lastNeighboursAt = time.Now()
 				wg.Add(1)
 				go func() {
@@ -360,7 +369,7 @@ func (t *Torrent) peersManager(workerCtx context.Context) {
 					} else if err == nil {
 						atomic.StoreInt32(&peer.fails, 0)
 						for _, node := range nodes.List {
-							t.addNode(node)
+							t.addNode(node, nil)
 						}
 					}
 				}()
