@@ -849,7 +849,7 @@ func (s *Server) startPeerSearcher() {
 					(t.lastDHTStore.IsZero() || atomic.LoadInt32(&t.lastDHTStoreFailed) != 0 || t.lastDHTStore.UnixNano() < atomic.LoadInt64(&t.lastDHTStoreCompletedAt)) {
 					t.lastDHTStore = time.Now()
 
-					go func(t *Torrent) {
+					func(t *Torrent) {
 						// TODO: fair queue
 						if !activeDownload {
 							updateSem <- struct{}{}

@@ -227,21 +227,21 @@ func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered boo
 		return nil
 	}
 
-	if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
-		t.isVerificationInProgress = true
-		go func() {
-			// it will remove corrupted pieces
-			if err = t.verify(t.db.VerifyOnStartup()); err != nil {
-				Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
-			}
-
-			t.mx.Lock()
-			defer t.mx.Unlock()
-
-			t.lastVerified = time.Now()
-			t.isVerificationInProgress = false
-		}()
-	}
+	//if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
+	//	t.isVerificationInProgress = true
+	//	go func() {
+	//		// it will remove corrupted pieces
+	//		if err = t.verify(t.db.VerifyOnStartup()); err != nil {
+	//			Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
+	//		}
+	//
+	//		t.mx.Lock()
+	//		defer t.mx.Unlock()
+	//
+	//		t.lastVerified = time.Now()
+	//		t.isVerificationInProgress = false
+	//	}()
+	//}
 
 	t.downloadAll = downloadAll
 	t.downloadOrdered = downloadOrdered
@@ -252,7 +252,7 @@ func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered boo
 
 	t.globalCtx, t.pause = context.WithCancel(context.Background())
 
-	go t.peersManager(t.globalCtx)
+	//go t.peersManager(t.globalCtx)
 
 	if t.IsCompleted() {
 		//	t.complete()
@@ -274,7 +274,7 @@ func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered boo
 func (t *Torrent) peersManager(workerCtx context.Context) {
 	defer Logger("[STORAGE_PEERS] PEER MANAGER STOPPED", "BAG", hex.EncodeToString(t.BagID))
 
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
