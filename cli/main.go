@@ -10,6 +10,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/big"
+	"math/bits"
+	"net"
+	"net/netip"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/pterm/pterm"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -32,15 +42,6 @@ import (
 	"github.com/xssnick/tonutils-storage/db"
 	"github.com/xssnick/tonutils-storage/provider"
 	"github.com/xssnick/tonutils-storage/storage"
-	"math/big"
-	"math/bits"
-	"net"
-	"net/netip"
-	"os"
-	"runtime"
-	"strings"
-	"sync"
-	"time"
 )
 
 var (
@@ -306,7 +307,12 @@ func main() {
 	srv := storage.NewServer(dhtClient, gate, cfg.Key, serverMode, *DHTParallelism)
 	Connector = storage.NewConnector(srv)
 
-	Storage, err = db.NewStorage(ldb, Connector, *ForcePieceSize, true, *NoVerify, *NoRemove, nil)
+	Storage, err = db.NewStorage(ldb, Connector, db.Config{
+		ForcePieceSize:             uint32(*ForcePieceSize),
+		StartWithoutActiveFilesToo: true,
+		SkipVerify:                 *NoVerify,
+		NoRemove:                   *NoRemove,
+	})
 	if err != nil {
 		pterm.Error.Println("Failed to init storage:", err.Error())
 		os.Exit(1)
