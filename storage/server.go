@@ -423,7 +423,7 @@ func (p *storagePeer) updateInitPieces(ctx context.Context) error {
 
 		var updRes Ok
 
-		ctxReq, cancel := context.WithTimeout(ctx, 7*time.Second)
+		ctxReq, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := p.conn.rldp.DoQuery(ctxReq, 1<<20, overlay.WrapQuery(p.overlay, up), &updRes)
 		cancel()
 		if err != nil {
