@@ -1,11 +1,13 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -376,10 +378,14 @@ func (t *Torrent) startDownload(report func(Event)) error {
 				defer fetch.Stop()
 
 				var currentFile FSFile
+				var currentFileToBeRemoved bool
 				var currentFileId uint32
 
 				defer func() {
 					if currentFile != nil {
+						if currentFileToBeRemoved {
+							os.Remove(currentFile.Name())
+						}
 						currentFile.Close()
 					}
 				}()
@@ -412,12 +418,16 @@ func (t *Torrent) startDownload(report func(Event)) error {
 								err = func() error {
 									if currentFile == nil || currentFileId != file.Index {
 										if currentFile != nil {
+											if currentFileToBeRemoved {
+												os.Remove(currentFile.Name())
+											}
 											currentFile.Close()
 										}
 
 										for x := 1; x <= 5; x++ {
 											// we retry because on Windows close file behaves
 											// like async, and it may throw that file still opened
+											currentFileToBeRemoved = false
 											currentFile, err = t.db.GetFS().Open(rootPath+"/"+file.Name, OpenModeWrite)
 											if err != nil {
 												Logger(fmt.Errorf("failed to create or open file %s: %w", file.Name, err).Error())
@@ -446,7 +456,14 @@ func (t *Torrent) startDownload(report func(Event)) error {
 										if file.FromPiece == piece {
 											data = data[file.FromPieceOffset:]
 										}
-
+										if bytes.Count(data, []byte{0x0, 0x1, 0x2, 0x3}) > 1 {
+											currentFileToBeRemoved = true
+										}
+										if currentFileToBeRemoved && bytes.ContainsFunc(data, func(r rune) bool {
+											return r != 0x0 && r != 0x1 && r != 0x2 && r != 0x3 // any other byte
+										}) {
+											currentFileToBeRemoved = false
+										}
 										_, err = currentFile.WriteAt(data, fileOff)
 										if err != nil {
 											return fmt.Errorf("failed to write file %s: %w", file.Name, err)
