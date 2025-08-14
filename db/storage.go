@@ -7,23 +7,38 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+
 	"github.com/rs/zerolog/log"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-storage/storage"
-	"path/filepath"
-	"sort"
-	"sync"
-	"time"
 )
 
-type Event int
+type Config struct {
+	ForcePieceSize             uint32
+	StartWithoutActiveFilesToo bool
+	SkipVerify                 bool
+	NoRemove                   bool
+	DisableTorrentLoading      bool // if true, torrents will not be loaded from db on startup.
+	Notifier                   chan *Event
+}
+
+type EventType int
+type Event struct {
+	Event   EventType
+	Torrent *storage.Torrent
+}
 
 const (
-	EventTorrentUpdated Event = iota
+	EventTorrentUpdated EventType = iota
 	EventUploadUpdated
+	EventTorrentLoaded
 )
 
 type Storage struct {
@@ -34,35 +49,38 @@ type Storage struct {
 	skipVerify      bool
 	forcePieceSize  uint32
 
-	notifyCh chan Event
+	notifyCh chan *Event
 	db       *leveldb.DB
 	mx       sync.RWMutex
 }
 
-func NewStorage(db *leveldb.DB, connector storage.NetConnector, forcePieceSize int, startWithoutActiveFilesToo bool, skipVerify bool, noRemove bool, notifier chan Event) (*Storage, error) {
-	if forcePieceSize < 0 {
-		return nil, fmt.Errorf("invalid piece size flag")
-	}
-
+func NewStorage(db *leveldb.DB, connector storage.NetConnector, config Config) (*Storage, error) {
 	s := &Storage{
 		torrents:        map[string]*storage.Torrent{},
 		torrentsOverlay: map[string]*storage.Torrent{},
 		db:              db,
 		connector:       connector,
 		fs: OsFs{
-			ctrl: NewFSControllerCache(noRemove),
+			ctrl: NewFSControllerCache(config.NoRemove),
 		},
-		notifyCh:       notifier,
-		skipVerify:     skipVerify,
-		forcePieceSize: uint32(forcePieceSize),
+		notifyCh:       config.Notifier,
+		skipVerify:     config.SkipVerify,
+		forcePieceSize: config.ForcePieceSize,
 	}
 
-	err := s.loadTorrents(startWithoutActiveFilesToo)
+	if config.DisableTorrentLoading {
+		return s, nil
+	}
+
+	err := s.LoadTorrents(config.StartWithoutActiveFilesToo)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load torrents from db: %w", err)
 	}
 
 	return s, nil
+}
+func (s *Storage) SetNotifier(notifier chan *Event) {
+	s.notifyCh = notifier
 }
 
 func (s *Storage) VerifyOnStartup() bool {
@@ -175,7 +193,7 @@ func (s *Storage) RemoveTorrent(t *storage.Torrent, withFiles bool) error {
 			_ = s.RemovePiece(t.BagID, i)
 		}
 	}
-	s.notify(EventTorrentUpdated)
+	s.notify(&Event{EventTorrentUpdated, t})
 	return nil
 }
 
@@ -206,10 +224,10 @@ func (s *Storage) SetTorrent(t *storage.Torrent) error {
 		return err
 	}
 
-	return s.addTorrent(t)
+	return s.addTorrent(t, false)
 }
 
-func (s *Storage) addTorrent(t *storage.Torrent) error {
+func (s *Storage) addTorrent(t *storage.Torrent, initialLoad bool) error {
 	id, err := tl.Hash(keys.PublicKeyOverlay{Key: t.BagID})
 	if err != nil {
 		return err
@@ -219,7 +237,12 @@ func (s *Storage) addTorrent(t *storage.Torrent) error {
 	s.torrents[string(t.BagID)] = t
 	s.torrentsOverlay[string(id)] = t
 	s.mx.Unlock()
-	s.notify(EventTorrentUpdated)
+	if initialLoad {
+		s.notify(&Event{EventTorrentLoaded, t})
+	} else {
+		s.notify(&Event{EventTorrentUpdated, t})
+	}
+
 	return nil
 }
 
@@ -237,7 +260,7 @@ type TorrentStored struct {
 	DownloadOrdered bool
 }
 
-func (s *Storage) loadTorrents(startWithoutActiveFilesToo bool) error {
+func (s *Storage) LoadTorrents(startWithoutActiveFilesToo bool) error {
 	iter := s.db.NewIterator(&util.Range{Start: []byte("bags:")}, nil)
 	for iter.Next() {
 		if !bytes.HasPrefix(iter.Key(), []byte("bags:")) {
@@ -286,7 +309,7 @@ func (s *Storage) loadTorrents(startWithoutActiveFilesToo bool) error {
 			}
 		}
 
-		err = s.addTorrent(t)
+		err = s.addTorrent(t, true)
 		if err != nil {
 			return fmt.Errorf("failed to add torrent %s from db: %w", hex.EncodeToString(t.BagID), err)
 		}
@@ -306,11 +329,14 @@ func (s *Storage) UpdateUploadStats(bagId []byte, val uint64) error {
 	if err := s.db.Put(k, data, nil); err != nil {
 		return err
 	}
-	s.notify(EventUploadUpdated)
+	s.notify(&Event{
+		Event:   EventUploadUpdated,
+		Torrent: nil,
+	})
 	return nil
 }
 
-func (s *Storage) notify(e Event) {
+func (s *Storage) notify(e *Event) {
 	if s.notifyCh != nil {
 		select {
 		case s.notifyCh <- e:

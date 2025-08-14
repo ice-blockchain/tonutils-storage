@@ -17,6 +17,7 @@ import (
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"math/rand"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -35,17 +36,21 @@ type Server struct {
 	bootstrapped map[string]*PeerConnection
 	mx           sync.RWMutex
 
+	registeredAddrs map[string]*address.List
+	addrMx          sync.RWMutex
+
 	closer func()
 }
 
 func NewServer(dht *dht.Client, gate *adnl.Gateway, key ed25519.PrivateKey, serverMode bool, dhtParallelism int) *Server {
 	s := &Server{
-		key:            key,
-		dht:            dht,
-		gate:           gate,
-		bootstrapped:   map[string]*PeerConnection{},
-		serverMode:     serverMode,
-		dhtParallelism: dhtParallelism,
+		key:             key,
+		dht:             dht,
+		gate:            gate,
+		bootstrapped:    map[string]*PeerConnection{},
+		serverMode:      serverMode,
+		dhtParallelism:  dhtParallelism,
+		registeredAddrs: map[string]*address.List{},
 	}
 	s.closeCtx, s.closer = context.WithCancel(context.Background())
 	s.gate.SetConnectionHandler(s.bootstrapPeerWrap)
@@ -127,8 +132,9 @@ func (s *Server) bootstrapPeer(client adnl.Peer) *PeerConnection {
 		rldp:          rl,
 		adnl:          client,
 		usedByBags:    map[string]*storagePeer{},
-		rldpQueue:     make(chan struct{}, 10),
+		rldpQueue:     make(chan struct{}, runtime.NumCPU()*10),
 		bagsInitQueue: make(chan struct{}, 8),
+		failedBags:    map[string]bool{},
 	}
 	s.bootstrapped[hex.EncodeToString(client.GetID())] = p
 
@@ -219,7 +225,7 @@ func (s *Server) handleRLDPQuery(peer *overlay.RLDPWrapper) func(transfer []byte
 		adnlId := peer.GetADNL().GetID()
 
 		var sesId *int64
-		var timeout = 7 * time.Second
+		var timeout = 25 * time.Second
 		switch q := req.(type) {
 		case GetPiece:
 			timeout = t.transmitTimeout()
@@ -425,7 +431,7 @@ func (p *storagePeer) updateInitPieces(ctx context.Context) error {
 			return fmt.Errorf("failed to acquire queue slot: %w", err)
 		}
 
-		ctxReq, cancel := context.WithTimeout(ctx, 7*time.Second)
+		ctxReq, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := p.conn.rldp.DoQuery(ctxReq, 1<<20, overlay.WrapQuery(p.overlay, up), &updRes)
 		cancel()
 		p.conn.FreeQueueSlot()
@@ -556,7 +562,13 @@ func (s *Server) checkAndUpdateBagDHT(ctx context.Context, torrent *Torrent, isS
 		nodesList = &overlay.NodesList{}
 	} else {
 		for i := range nodesList.List {
-			torrent.addNode(nodesList.List[i])
+			torrent.addNode(nodesList.List[i], func() *address.List {
+				adnlID, _ := tl.Hash(nodesList.List[i].ID.(keys.PublicKeyED25519))
+				s.addrMx.RLock()
+				addr := s.registeredAddrs[string(adnlID)]
+				s.addrMx.RUnlock()
+				return addr
+			})
 		}
 	}
 
@@ -639,7 +651,7 @@ func (s *Server) Stop() {
 	return
 }
 
-func (t *Torrent) addNode(node overlay.Node) {
+func (t *Torrent) addNode(node overlay.Node, getRegisteredAddrs func() *address.List) {
 	nodeId, err := tl.Hash(node.ID)
 	if err != nil {
 		return
@@ -662,8 +674,11 @@ func (t *Torrent) addNode(node overlay.Node) {
 		go func() {
 			ctx, cancel := context.WithTimeout(t.globalCtx, 120*time.Second)
 			defer cancel()
-
-			err := t.connector.ConnectToNode(ctx, t, &node, nil)
+			var addrs *address.List
+			if getRegisteredAddrs != nil {
+				addrs = getRegisteredAddrs()
+			}
+			err := t.connector.ConnectToNode(ctx, t, &node, addrs)
 			if err != nil {
 				Logger("[STORAGE] FAILED TO CONNECT TO NODE", hex.EncodeToString(nodeId), "FOR", hex.EncodeToString(t.BagID), err.Error())
 				return
@@ -700,7 +715,9 @@ func (s *Server) ConnectToNode(ctx context.Context, t *Torrent, node *overlay.No
 		Logger("[STORAGE] ADDR FOR NODE ", hex.EncodeToString(adnlID), "FOUND", addrs.Addresses[0].IP.String(), addrs.Addresses[0].Port, "PUBKEY", hex.EncodeToString(key.Key), "FOR", hex.EncodeToString(t.BagID), "ELAPSED", time.Since(start).Seconds())
 
 		addr := addrs.Addresses[0].IP.String() + ":" + fmt.Sprint(addrs.Addresses[0].Port)
-
+		s.addrMx.Lock()
+		s.registeredAddrs[string(adnlID)] = addrs
+		s.addrMx.Unlock()
 		ax, err := s.gate.RegisterClient(addr, key.Key)
 		if err != nil {
 			return fmt.Errorf("failed to connnect to node: %w", err)
@@ -722,7 +739,7 @@ func (s *Server) ConnectToNode(ctx context.Context, t *Torrent, node *overlay.No
 
 	success := true
 	if sessionCtx != nil {
-		success = stNode.initializeSession(sessionCtx, atomic.LoadInt64(&stNode.sessionId), true)
+		success = stNode.initializeSession(sessionCtx, atomic.LoadInt64(&stNode.sessionId), t.IsDownloadAll())
 	}
 
 	if success {
@@ -915,7 +932,7 @@ func (s *Server) startPeerSearcher() {
 
 					Logger("[STORAGE] TIME TO MAKE BAG DHT RECORD QUERY", hex.EncodeToString(t.BagID), "PRIORITIZED:", prioritized)
 
-					go func(t *Torrent) {
+					func(t *Torrent) {
 						isPr := false
 						// TODO: fair queue
 						if !prioritized {

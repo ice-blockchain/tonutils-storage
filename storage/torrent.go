@@ -10,6 +10,7 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 	"io"
 	"math/bits"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,7 @@ type FSFile interface {
 	io.WriterAt
 	io.Closer
 	Sync() error
+	Name() string
 }
 
 type FS interface {
@@ -225,6 +227,9 @@ func (t *Torrent) Stop() {
 }
 
 func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err error) {
+	return t.StartWithCallback(withUpload, downloadAll, downloadOrdered, nil)
+}
+func (t *Torrent) StartWithCallback(withUpload, downloadAll, downloadOrdered bool, report func(event Event)) (err error) {
 	t.activeUpload = withUpload
 
 	t.mx.Lock()
@@ -234,25 +239,25 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 		return nil
 	}
 
-	if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
-		if t.db.VerifyOnStartup() {
-			t.isVerificationInProgress = true
-			t.opWg.Add(1)
-			go func() {
-				defer t.opWg.Done()
-				// it will remove corrupted pieces
-				if _, err = t.Verify(t.globalCtx, true); err != nil {
-					Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
-				}
-
-				t.mx.Lock()
-				defer t.mx.Unlock()
-
-				t.lastVerified = time.Now()
-				t.isVerificationInProgress = false
-			}()
-		}
-	}
+	//if !t.isVerificationInProgress && t.lastVerified.Before(time.Now().Add(-30*time.Second)) {
+	//	if t.db.VerifyOnStartup() {
+	//		t.isVerificationInProgress = true
+	//		t.opWg.Add(1)
+	//		go func() {
+	//			defer t.opWg.Done()
+	//			// it will remove corrupted pieces
+	//			if _, err = t.Verify(t.globalCtx, true); err != nil {
+	//				Logger("Verification of", hex.EncodeToString(t.BagID), "failed:", err.Error())
+	//			}
+	//
+	//			t.mx.Lock()
+	//			defer t.mx.Unlock()
+	//
+	//			t.lastVerified = time.Now()
+	//			t.isVerificationInProgress = false
+	//		}()
+	//	}
+	//}
 
 	t.downloadAll = downloadAll
 	t.downloadOrdered = downloadOrdered
@@ -263,8 +268,8 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 
 	t.globalCtx, t.pause = context.WithCancel(context.Background())
 
-	t.opWg.Add(1)
-	go t.peersManager(t.globalCtx)
+	//t.opWg.Add(1)
+	//go t.peersManager(t.globalCtx)
 
 	if t.IsCompleted() {
 		//	t.complete()
@@ -277,6 +282,9 @@ func (t *Torrent) Start(withUpload, downloadAll, downloadOrdered bool) (err erro
 		if event.Name == EventErr && currFlag == t.currentDownloadFlag {
 			currPause()
 		}
+		if report != nil {
+			report(event)
+		}
 	})
 }
 
@@ -284,7 +292,7 @@ func (t *Torrent) peersManager(workerCtx context.Context) {
 	defer t.opWg.Done()
 	defer Logger("[STORAGE_PEERS] PEER MANAGER STOPPED", "BAG", hex.EncodeToString(t.BagID))
 
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -353,12 +361,16 @@ func (t *Torrent) peersManager(workerCtx context.Context) {
 					err := peer.ping(qCtx)
 					if err != nil && atomic.AddInt32(&peer.fails, 1) > 3 {
 						Logger("[STORAGE_PEERS] PING FAILED FOR PEER", hex.EncodeToString(peer.nodeId), "AND TOO MANY FAILS, CLOSING CONNECTION", "BAG", hex.EncodeToString(t.BagID))
+						peer.conn.FailedFor(peer, err, true)
 						peer.Close()
+						return
 					} else if err == nil {
 						atomic.StoreInt32(&peer.fails, 0)
+						peer.conn.FailedFor(peer, nil, true)
 					}
 				}()
-			} else if time.Since(peer.lastNeighboursAt) > 30*time.Second {
+			}
+			if time.Since(peer.lastNeighboursAt) > 30*time.Second {
 				peer.lastNeighboursAt = time.Now()
 				wg.Add(1)
 				go func() {
@@ -374,7 +386,7 @@ func (t *Torrent) peersManager(workerCtx context.Context) {
 					} else if err == nil {
 						atomic.StoreInt32(&peer.fails, 0)
 						for _, node := range nodes.List {
-							t.addNode(node)
+							t.addNode(node, nil)
 						}
 					}
 				}()
@@ -562,7 +574,25 @@ func (t *Torrent) getPieceInternal(id uint32, verify bool) (*Piece, error) {
 			read := func(path string, from int64) error {
 				n, err := t.db.GetFS().GetController().AcquireRead(path, block[offset:], from)
 				if err != nil && err != io.EOF {
-					return err
+					if os.IsNotExist(err) {
+						n = len(block) - offset
+						if uint64(n) >= f.Size {
+							n = int(f.Size)
+						}
+
+						pattern := []byte{0x0, 0x1, 0x2, 0x3}
+						if len(block[offset:]) < len(pattern) {
+							copy(block[offset:], pattern[:len(block[offset:])])
+							offset += n
+							return nil
+						}
+						copy(block[offset:], pattern)
+						for j := len(pattern); j < len(block[offset:]); j *= 2 {
+							copy(block[offset:][j:], block[offset:][:j])
+						}
+					} else {
+						return err
+					}
 				}
 
 				offset += n

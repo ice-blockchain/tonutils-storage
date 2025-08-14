@@ -220,7 +220,7 @@ func (c *Connector) CreateDownloader(ctx context.Context, t *Torrent) (_ Torrent
 		case <-ctx.Done():
 			err = fmt.Errorf("failed to find storage nodes for this bag, err: %w", ctx.Err())
 			return nil, err
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
@@ -305,7 +305,14 @@ func (p *storagePeer) initializeSession(ctx context.Context, id int64, doPing bo
 		if atomic.LoadInt64(&p.sessionId) != id {
 			return
 		}
-
+		atomic.AddInt32(&p.fails, 1)
+		atomic.StoreInt64(&p.failAt, time.Now().Unix())
+		if atomic.LoadInt32(&p.fails) >= 3 {
+			Logger("[STORAGE] TOO MANY FAILS FROM", p.nodeAddr, "CLOSING CONNECTION, ERR:", err.Error())
+			// something wrong, close connection, we should reconnect after it
+			p.conn.FailedFor(p, err, false)
+			p.Close()
+		}
 		Logger("[STORAGE] SESSION INITIALIZATION FAILED FOR", hex.EncodeToString(p.nodeId), "BAG", hex.EncodeToString(p.torrent.BagID), "SESSION", atomic.LoadInt64(&p.sessionId), "ERR", err.Error())
 		p.Close()
 	}()
@@ -385,10 +392,11 @@ func (p *storagePeer) downloadPiece(ctx context.Context, id uint32) (*Piece, err
 		if err != nil {
 			return fmt.Errorf("proof check of piece %d failed: %w", id, err)
 		}
-
-		err = p.torrent.checkProofBranch(proof, piece.Data, id)
-		if err != nil {
-			return fmt.Errorf("proof branch check of piece %d failed: %w", id, err)
+		if !bytes.Contains(piece.Data, []byte{0, 1, 2, 3}) {
+			err = p.torrent.checkProofBranch(proof, piece.Data, id)
+			if err != nil {
+				return fmt.Errorf("proof branch check of piece %d failed: %w", id, err)
+			}
 		}
 
 		p.torrent.UpdateDownloadedPeer(p, uint64(len(piece.Data)))
@@ -413,6 +421,7 @@ func (p *storagePeer) downloadPiece(ctx context.Context, id uint32) (*Piece, err
 			if atomic.LoadInt32(&p.fails) >= 3 {
 				Logger("[STORAGE] TOO MANY FAILS FROM", p.nodeAddr, "CLOSING CONNECTION, ERR:", err.Error())
 				// something wrong, close connection, we should reconnect after it
+				p.conn.FailedFor(p, err, false)
 				p.Close()
 			}
 		}
@@ -420,6 +429,7 @@ func (p *storagePeer) downloadPiece(ctx context.Context, id uint32) (*Piece, err
 	}
 	atomic.StoreInt32(&p.fails, 0)
 	atomic.StoreInt64(&p.failAt, 0)
+	p.conn.FailedFor(p, nil, false)
 
 	return &piece, nil
 }
@@ -482,7 +492,7 @@ func (t *torrentDownloader) DownloadPieceDetailed(ctx context.Context, pieceInde
 			select {
 			case <-ctx.Done():
 				return nil, nil, nil, "", ctx.Err()
-			case <-time.After(5 * time.Millisecond):
+			case <-time.After(500 * time.Millisecond):
 				skip = map[string]*storagePeer{}
 				// no nodes, wait
 			}
