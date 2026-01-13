@@ -1,6 +1,6 @@
 module github.com/xssnick/tonutils-storage
 
-go 1.23.3
+go 1.24.0
 
 require (
 	github.com/kevinms/leakybucket-go v0.0.0-20200115003610-082473db97ca
@@ -10,7 +10,7 @@ require (
 	github.com/ton-blockchain/adnl-tunnel v0.1.6
 	github.com/xssnick/tonutils-go v1.14.1
 	github.com/xssnick/tonutils-storage-provider v0.3.11
-	golang.org/x/sync v0.16.0
+	golang.org/x/sync v0.18.0
 )
 
 require (
@@ -41,8 +41,8 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/xssnick/raptorq v1.0.0 // indirect
 	github.com/xssnick/ton-payment-network v1.0.0 // indirect
-	golang.org/x/crypto v0.40.0 // indirect
-	golang.org/x/sys v0.34.0 // indirect
-	golang.org/x/term v0.33.0 // indirect
-	golang.org/x/text v0.27.0 // indirect; indirects
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/term v0.37.0 // indirect
+	golang.org/x/text v0.31.0 // indirect; indirects
 )
